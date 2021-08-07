@@ -1,0 +1,1 @@
+python ./train.py --model-name "RotatE" --target-KB "FB15k-237" --epochs 1000 --embedding-dim 1000 --batch-size 1024 --gamma 24.0 --lr 0.0001 --negative-adversarial-sampling --do-test
