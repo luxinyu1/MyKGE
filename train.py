@@ -396,7 +396,9 @@ def main():
 
             res = test_or_valid(model, test_triples, all_true_triples, nentity, nrelation, use_cuda, args)
 
-            logger.info("[test]:", res)
+            logger.info("[test]: MR:{}, MRR:{}, Hits@1: {}, Hits@3: {}, Hits@10:{}".format(
+                res['MR'], res['MRR'], res['HITS@1'], res['HITS@3'], res['HITS@10']
+            ))
                 
 if __name__ == "__main__":
     main()
