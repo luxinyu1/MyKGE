@@ -1,14 +1,11 @@
 import numpy as np
 import logging
 import os
-from tqdm import tqdm, trange
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset, Dataset
 
-from utils.kb import load_kb_file, compute_statistics
-from utils.paths import get_dataset_dir
+from utils.kb import compute_statistics
 from utils.meta import kb_metadata
 
 SANITY_EPS = 1e-8
@@ -87,10 +84,19 @@ def instantiate_box_embeddings(scale_mult_shape, rel_tbl_shape, base_norm_shapes
     embedding_base_points = init_var(rel_tbl_shape, -0.5 / sqrt_dim, 0.5 / sqrt_dim)
     # [relations_num, max_arity, embedding_dim]
     embedding_deltas = torch.mul(scale_multiples, base_norm_shapes)
-    return embedding_base_points, embedding_deltas, scale_multiples
+    return torch.nn.Parameter(embedding_base_points), torch.nn.Parameter(embedding_deltas), torch.nn.Parameter(scale_multiples)
 
 def add_padding(input_tensor):
-    return torch.cat([input_tensor, torch.zeros([1, input_tensor.shape[1]])], dim=0)
+    return torch.cat((input_tensor, torch.zeros([1, input_tensor.shape[1]])), dim=0)
+
+def total_box_size_reg(rel_deltas, reg_lambda, log_box_size): # Regularization based on total box size
+    rel_mean_width = torch.mean(torch.log(torch.abs(rel_deltas) + SANITY_EPS), axis=2)
+    min_width = torch.min(rel_mean_width).detach() # no autogard
+    rel_width_ratios = torch.exp(rel_mean_width - min_width)
+    total_multiplier = torch.log(torch.sum(rel_width_ratios) + SANITY_EPS)
+    total_width = total_multiplier + min_width
+    size_constraint_loss = reg_lambda * (total_width - log_box_size) ** 2
+    return size_constraint_loss
 
 def q2b_loss(points, lower_corner, upper_corner):
     # Query2Box Loss Function: https://arxiv.org/pdf/2002.05969.pdf
@@ -100,14 +106,14 @@ def q2b_loss(points, lower_corner, upper_corner):
     
     return dist_outside, dist_inside
 
-def loss_function_q2b(batch_points, batch_mask, rel_bx_low, rel_bx_high, batch_rel_mults, dim_dropout_prob=zero, order=2, alpha=0.2):
-    batch_box_inside, batch_box_outside = q2b_loss("Q2B_Box_Loss", batch_points, rel_bx_low, rel_bx_high,
+def loss_function_q2b(batch_points, rel_box_low, rel_box_high, batch_rel_mults, dim_dropout_prob=zero, order=2, alpha=0.2):
+    batch_box_inside, batch_box_outside = q2b_loss("Q2B_Box_Loss", batch_points, rel_box_low, rel_box_high,
                                                 batch_rel_mults)
     
     bbi = torch.norm(F.dropout(batch_box_inside, p=dim_dropout_prob), dim=2, p=order)
-    bbi_masked = torch.sum(torch.mul(bbi, batch_mask), dim=1)
+    bbi_masked = torch.sum(bbi, dim=1)
     bbo = torch.norm(F.dropout(batch_box_outside, p=dim_dropout_prob), dim=2, p=order)
-    bbo_masked = torch.sum(torch.mul(bbo, batch_mask), dim=1)
+    bbo_masked = torch.sum(bbo, dim=1)
     total_loss = alpha * bbi_masked + bbo_masked
 
     return total_loss
@@ -123,10 +129,10 @@ def polynomial_loss(points, lower_corner, upper_corner):
                             widths_p1 * torch.abs(points - centres) - (widths / 2) * (widths_p1 - 1 / widths_p1))
     return width_cond
 
-def loss_function_poly(batch_points, batch_mask, rel_bx_low, rel_bx_high, batch_rel_mults, dim_dropout_prob=zero, order=1):
-    poly_loss = polynomial_loss(batch_points, rel_bx_low, rel_bx_high, batch_rel_mults)
+def loss_function_poly(batch_points, rel_box_low, rel_box_high, batch_rel_mults, dim_dropout_prob=zero, order=1):
+    poly_loss = polynomial_loss(batch_points, rel_box_low, rel_box_high)
     poly_loss = torch.norm(F.dropout(poly_loss, p=dim_dropout_prob), dim=2, p=order)
-    total_loss = torch.sum(torch.mul(poly_loss, batch_mask), dim=1)
+    total_loss = torch.sum(poly_loss, dim=1)
     return total_loss
 
 class MyBoxE(nn.Module):
@@ -144,7 +150,6 @@ class MyBoxE(nn.Module):
         except KeyError:
             raise KeyError("No KB named "+self.args.target_KB)
         
-        self.train_dataloader = self.load_training_set()
         self.embed()
 
     def embed(self):
@@ -153,13 +158,13 @@ class MyBoxE(nn.Module):
         self.sqrt_dim = torch.sqrt(torch.tensor(self.args.embedding_dim + 0.0))
         # 限定了embeddings的上下界[-1/2*sqrt(embedding_dim), 1/2*sqrt(embedding_dim)]
         self.entity_points = init_var(entity_table_shape, -0.5 / self.sqrt_dim, 0.5 / self.sqrt_dim)
-        self.entities_with_pad = add_padding(self.entity_points)
+        self.entities_with_pad = torch.nn.Parameter(add_padding(self.entity_points))
         # translational bumps
         if self.args.use_bumps:
             self.entity_bumps = init_var(entity_table_shape, -0.5 / self.sqrt_dim, 0.5 / self.sqrt_dim)
             if self.args.normed_bumps:  # Normalization of bumps option
                 self.entity_bumps = F.normalize(self.entity_bumps, p=2, dim=1)
-            self.bumps_with_pad = add_padding(self.entity_bumps)
+            self.bumps_with_pad = torch.nn.Parameter(add_padding(self.entity_bumps))
         # relation embeddings
         relation_table_shape = [self.relations_num, self.max_arity, self.args.embedding_dim]
         scale_multiples_shape = [self.relations_num, self.max_arity, 1]
@@ -190,69 +195,71 @@ class MyBoxE(nn.Module):
                                     self.norm_rel_shapes, self.sqrt_dim, self.args.hard_total_size,
                                     self.total_size, relation_stats, self.args.fixed_width)
 
-        if self.args.rule_dir:   # Rule Injection logic
+        if self.args.rule_dir:   # TODO:Rule Injection logic
             pass
         else:
             pass
 
+    def forward(self, sample):
 
-    def load_training_set(self):
-        kb_data = load_kb_file(get_dataset_dir(self.args.target_KB) / 'train.kb')
-        kb_data = torch.tensor(kb_data)
-        # if not options.restricted_training:
-        num_training_samples = kb_data.shape[0]
-        train_data = TensorDataset(kb_data)
+        # TODO: for loop needs to be improved
+        batch_points = []
+        for i in range(self.max_arity):
+            batch_points.append(torch.index_select(
+                self.entities_with_pad, 
+                dim=0, 
+                index=torch.squeeze(sample[:, i])
+            ).unsqueeze(1))
+        batch_points = torch.cat(batch_points, dim=1)
+
+        if self.args.use_bumps:
+            batch_bumps = []
+            for i in range(self.max_arity):
+                batch_bumps.append(torch.index_select(
+                    self.bumps_with_pad, 
+                    dim=0,
+                    index=torch.squeeze(sample[:, i])
+                ).unsqueeze(1))
+            batch_bumps = torch.cat(batch_bumps, dim=1)
+            batch_bump_sum = torch.sum(batch_bumps, dim=1, keepdims=True)
+            batch_points += batch_bump_sum - batch_bumps
+
+        self.batch_points = batch_points
         
-        train_sampler = SequentialSampler(train_data)
-        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=self.args.batch_size)
-        return train_dataloader
+        batch_rel_bases = torch.index_select(
+            self.rel_bases,
+            dim=0,
+            index=torch.squeeze(sample[:, -1])
+        )
 
-    # else:
-    #     tr_np_arr = tr_np_arr[:options.restriction, :]
-    #     self.nb_training_facts = options.restriction
-    # if self.augment_inv:
-    #     tr_np_arr_augmentation = np.zeros_like(tr_np_arr)
-    #     tr_np_arr_augmentation[:, 0] = tr_np_arr[:, 0] + self.original_nb_rel
-    #     tr_np_arr_augmentation[:, 1] = tr_np_arr[:, 2]
-    #     tr_np_arr_augmentation[:, 2] = tr_np_arr[:, 1]
-    #     tr_np_arr_augmentation[:, 3] = tr_np_arr[:, 3]
-    #     tr_np_arr = np.concatenate([tr_np_arr, tr_np_arr_augmentation], axis=0)
-    #     self.nb_training_facts = 2 * self.nb_training_facts
+        batch_rel_deltas = torch.index_select(
+            self.rel_deltas,
+            dim=0,
+            index=torch.squeeze(sample[:, -1])
+        )
 
-    def forward(self):
-        # Forward function that calculate the score of a batch of triples.
+        batch_rel_multiples = torch.index_select(
+            self.rel_multiples,
+            dim=0,
+            index=torch.squeeze(sample[:, -1])
+        )
 
-        if self.reg_lambda > 0 and not self.hard_total_size:
-            if self.fixed_width:
-                print("Box size regularization with fixed widths is redundant, so regularization has been disabled")
-                self.reg_lambda = -1
-                self.reg_loss = 0.0
-            else:
-                self.reg_loss = total_box_size_reg(rel_deltas=self.rel_deltas, reg_lambda=self.reg_lambda,
-                                                   log_box_size=self.total_log_box_size)
-        else:
-            self.reg_loss = 0.0
-        if self.obj_fct == Cnst.NEG_SAMP:
-            self.loss = - self.loss_n_term - self.loss_p_term + self.reg_loss
-        elif self.obj_fct == Cnst.MARGIN_BASED:
-            self.loss = tf.reduce_sum(tf.maximum(0.0, self.margin + self.loss_pos - self.loss_neg))
+        if self.args.loss_fct == 'poly':
+            loss_function = loss_function_poly
+        elif self.args.loss_fct == 'q2b':
+            loss_function = loss_function_q2b
 
-        if self.reg_points > 0:
-            self.loss += self.reg_points * (tf.nn.l2_loss(self.batch_point_representations) +
-                                            tf.nn.l2_loss(self.batch_rel_bases))
+        rel_box_low, rel_box_high = compute_box(batch_rel_bases, batch_rel_deltas)
+        batch_points = self.args.bound_scale * torch.tanh(batch_points) if self.args.bounded_pt_space else batch_points
+        if self.args.bounded_box:
+            rel_box_low, rel_box_high = map(lambda x: self.args.bound_scale * torch.tanh(x), [rel_box_low, rel_box_high])
 
-        return score
+        loss = loss_function(batch_points=batch_points, rel_box_low=rel_box_low,
+                            rel_box_high=rel_box_high, batch_rel_mults=batch_rel_multiples, order=self.args.loss_norm_order,
+                            dim_dropout_prob=self.args.dropout)
+        
+        return loss
 
-    def train(self):
-
-
-        for e in trange(int(self.args.epochs), desc="Epoch"):
-            
-            average_epoch_loss = 0
-
-            for step, batch in enumerate(tqdm(self.train_dataloader, desc="Iteration")):
-
-                pass
 
 class MyRotatE(nn.Module):
 

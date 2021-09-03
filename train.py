@@ -6,10 +6,11 @@ from tqdm import tqdm, trange
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
-from model import MyBoxE, MyRotatE
-from utils.kb import get_dicts, read_triples
-from utils.paths import CHECKPOINTS_DIR
-from dataloader import TrainDataset, TestDataset, BidirectionalOneShotIterator
+from model import MyBoxE, MyRotatE, total_box_size_reg
+from utils.kb import get_dicts, read_triples, load_kb_file
+from utils.paths import CHECKPOINTS_DIR, get_dataset_dir
+from utils.meta import kb_metadata
+from dataloader import TrainDataset, TestDataset, CrossSampling_TrainDataset, CrossSampling_TestDataset, BidirectionalOneShotIterator
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -20,6 +21,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("train")
+
+SANITY_EPS = 1e-8
 
 def parse_args(parser):
 
@@ -40,9 +43,9 @@ def parse_args(parser):
                         type=float, 
                         default=1e-4,
                         help="Learning Rate to use for training")
-    parser.add_argument("--negative-example-num",
+    parser.add_argument('--negative-sample-size', 
+                        default=128, 
                         type=int,
-                        default=100,
                         help="Number of Negative Examples per positive example")
     parser.add_argument("--batch-size", 
                         type=int, 
@@ -51,6 +54,7 @@ def parse_args(parser):
     parser.add_argument("--loss-margin",
                         type=float,
                         required=False,
+                        default=3.0,
                         help="The maximum negative distance to consider")
     parser.add_argument("--embedding-dim",
                         type=int,
@@ -65,7 +69,7 @@ def parse_args(parser):
     parser.add_argument("--log-interval",
                         type=int,
                         default=100,
-                        help="Log interval in training.")
+                        help="Log interval(Step) in training.")
     parser.add_argument("--valid-interval",
                         type=int,
                         default=10,
@@ -85,10 +89,13 @@ def parse_args(parser):
     parser.add_argument("--negative-adversarial-sampling",
                         default=False,
                         action='store_true')
+    parser.add_argument("--neg-sampling-opt",
+                        type=str,
+                        default='uniform') # TODO: merge this two options
     parser.add_argument('--adversarial-temperature', 
                         default=1.0, 
                         type=float)
-
+    # args for BoxE
     parser.add_argument("--use-bumps",
                         type=bool,
                         default=True,
@@ -110,6 +117,19 @@ def parse_args(parser):
                         action='store_true',
                         help="Limit boxes (following bumps and all processing in the unbounded space) to a minimum "
                             "and maximum size per dimension")
+    parser.add_argument("--bound-scale",
+                        type=float,
+                        default=1.0,
+                        help="The finite bounds of the space (if bounded)")
+    parser.add_argument("--bounded-pt-space",
+                        type=bool,
+                        default=True,
+                        help="Limit points (following bumps and all processing in the unbounded space) to be mapped to "
+                            "the bounded tanh ]-1,1[ space")
+    parser.add_argument("--bounded-box",
+                        type=bool,
+                        default=True,
+                        help="")
     parser.add_argument("--fixed-width", 
                         default=False,
                         action='store_true', 
@@ -131,13 +151,30 @@ def parse_args(parser):
                         type=str, 
                         default=False,
                         help="Specify the txt file to read rules from (default no)")
-
+    parser.add_argument("--reg-lambda",
+                        type=float,
+                        default=0,
+                        help="The weight of L2 regularization over bound width (BOX model) to apply")
+    parser.add_argument("--reg-points",
+                        type=float,
+                        default=0,
+                        help="Regularisation factor to apply to batch to prevent excessive divergence from center")
+    parser.add_argument("--obj-fct",
+                        type=str,
+                        default='neg_samp')
     parser.add_argument("--gamma",
                         default=12.0, 
                         type=float)
-    parser.add_argument('--negative-sample-size', 
-                        default=128, 
-                        type=int)
+    parser.add_argument("--loss-fct",
+                        default='poly',
+                        type=str)
+    parser.add_argument("--loss-norm-order",
+                        type=int,
+                        default=2)
+    parser.add_argument("--dropout",
+                        type=float,
+                        default=0.0)
+
     parser.add_argument('--warm-up-steps', 
                         default=None, 
                         type=int)
@@ -152,13 +189,71 @@ def parse_args(parser):
 
     return args
 
-def test_or_valid(model, triples, all_true_triples, nentity, nrelation, use_cuda, args):
+def test_or_valid(model, triples, nentity, nrelation, use_cuda, args):
+
+    model.eval()
+    
+    test_dataloader = DataLoader(
+        TestDataset(
+            triples,
+            nentity,
+            nrelation,
+            args
+        ),
+        batch_size=args.test_valid_batch_size,
+        num_workers=0,
+        collate_fn=TestDataset.collate_fn
+    )
+
+    logs = []
+
+    with torch.no_grad():
+        for samples, corrupt_samples in test_dataloader:
+
+            # Notes: torch.unbind remove the extra dim after spliting the origin tensor
+
+            _corrupt_samples = torch.unbind(corrupt_samples, dim=3)
+
+            __samples = torch.chunk(samples, samples.shape[0], dim=0)
+
+            for pos, corrupt_batch in enumerate(_corrupt_samples):
+
+                # TODO: fake batch here, remove the for loop in the future
+                
+                __corrupt_samples = torch.unbind(corrupt_batch, dim=0)
+
+                for sample, corrupt_sample in zip(__samples, __corrupt_samples):
+
+                    if use_cuda:
+                        corrupt_sample = corrupt_sample.cuda()
+                        sample = sample.cuda()
+
+                    score = model(corrupt_sample)
+
+                    indices = torch.argsort(score, dim=0, descending=True)
+                    rank = indices[sample[:,pos]].item() + 1
+                    logs.append({
+                        'MRR': 1.0/rank,
+                        'MR': float(rank),
+                        'HITS@1': 1.0 if rank <= 1 else 0.0,
+                        'HITS@3': 1.0 if rank <= 3 else 0.0,
+                        'HITS@10': 1.0 if rank <= 10 else 0.0,
+                    })
+
+        metrics = {}
+        for metric in logs[0].keys():
+            metrics[metric] = sum([log[metric] for log in logs])/len(logs)
+    
+    return metrics
+
+
+def crosssampling_test_or_valid(model, triples, all_true_triples, nentity, nrelation, use_cuda, args):
 
     model.eval()
     
     #Prepare dataloader for evaluation
     test_dataloader_head = DataLoader(
-        TestDataset(
+        CrossSampling_TestDataset(
             triples, 
             all_true_triples, 
             nentity,
@@ -167,11 +262,11 @@ def test_or_valid(model, triples, all_true_triples, nentity, nrelation, use_cuda
         ), 
         batch_size=args.test_valid_batch_size,
         num_workers=0, 
-        collate_fn=TestDataset.collate_fn
+        collate_fn=CrossSampling_TestDataset.collate_fn
     )
 
     test_dataloader_tail = DataLoader(
-        TestDataset(
+        CrossSampling_TestDataset(
             triples, 
             all_true_triples, 
             nentity, 
@@ -180,7 +275,7 @@ def test_or_valid(model, triples, all_true_triples, nentity, nrelation, use_cuda
         ), 
         batch_size=args.test_valid_batch_size,
         num_workers=0, 
-        collate_fn=TestDataset.collate_fn
+        collate_fn=CrossSampling_TestDataset.collate_fn
     )
     
     test_dataset_list = [test_dataloader_head, test_dataloader_tail]
@@ -246,12 +341,155 @@ def main():
 
     if args.model_name == 'BoxE':
 
+        try:
+            nentity = kb_metadata[args.target_KB][0]
+            nrelation = kb_metadata[args.target_KB][1]
+        except KeyError:
+            raise KeyError("No KB named "+args.target_KB)
+
+        # pos_data = load_kb_file(get_dataset_dir(args.target_KB) / 'train.kb')
+        # pos_data = torch.tensor(pos_data)
+
+        entity2id, relation2id = get_dicts(args.target_KB)
+
+        train_triples, test_triples, valid_triples = read_triples(args.target_KB, entity2id, relation2id)
+
+        train_dataloader = DataLoader(
+            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size), 
+            batch_size=args.batch_size,
+            shuffle=True, 
+            num_workers=0, # change here to cpu_num//2 if possible
+            collate_fn=TrainDataset.collate_fn
+        )
+
         model = MyBoxE(args)
-        model.train()
+
+        if not args.no_cuda and torch.cuda.is_available():
+            use_cuda = True
+            model = model.cuda()
+        else:
+            use_cuda = False
+    
+        current_learning_rate = args.lr
+
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()), 
+            lr=current_learning_rate
+        )
+
+        all_loss = 0
+
+        for epoch in trange(int(args.epochs), desc="Epoch"):
+
+            model.train()
+
+            for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
+
+                positive_samples, negative_samples = batch
+                
+                optimizer.zero_grad()
+
+                negative_samples = negative_samples.flatten(start_dim=0, end_dim=1)
+
+                if use_cuda:
+
+                    positive_samples = positive_samples.cuda()
+                    negative_samples = negative_samples.cuda()
+
+                positive_loss = model(positive_samples)
+                negative_loss = model(negative_samples)
+
+                if args.obj_fct == 'neg_samp':
+                    loss_pos = torch.log(torch.sigmoid(args.loss_margin - positive_loss) + SANITY_EPS)
+                elif args.obj_fct == 'margin_based':
+                    loss_pos = positive_loss
+
+                if args.neg_sampling_opt == 'uniform':
+                    if args.obj_fct == 'neg_samp':  # Standard Objective
+                        loss_neg = torch.log(torch.sigmoid(negative_loss - args.loss_margin) + SANITY_EPS)
+                        loss_n_term = torch.sum(loss_neg) / args.negative_sample_size
+                    elif args.obj_fct == 'margin_based':   # Objective used in TransE
+                        reshaped_neg_dists = torch.reshape(negative_loss, [args.negative_sample_size,
+                                                                                    args.batch_size])
+                        reshaped_neg_dists = torch.transpose(reshaped_neg_dists)
+                        loss_neg = torch.mean(reshaped_neg_dists, axis=1)
+                        loss_n_term = torch.sum(loss_neg)
+
+                elif args.neg_sampling_opt == 'selfadv':
+
+                    reshaped_neg_dists = torch.reshape(negative_loss, [args.negative_sample_size,
+                                                                                args.batch_size])
+                    reshaped_neg_dists = torch.transpose(reshaped_neg_dists, perm=[1, 0],
+                                                            name='transposed_neg', conjugate=False)
+                    softmax_pre_scores = torch.negative(reshaped_neg_dists) * args.adversarial_temperature
+
+                    neg_softmax = torch.nn.softmax(softmax_pre_scores, axis=1)
+                    if args.obj_fct == 'neg_samp':
+                        loss_neg_batch = torch.log(torch.sigmoid(reshaped_neg_dists - args.margin) + SANITY_EPS)
+                        loss_neg = torch.multiply(neg_softmax, loss_neg_batch)
+                    elif args.obj_fct == 'margin_based':
+                        loss_neg = torch.multiply(neg_softmax, reshaped_neg_dists)
+                    loss_n_term = torch.sum(loss_neg)
+
+                loss_p_term = torch.sum(loss_pos)
+
+                # if args.reg_lambda > 0 and not args.hard_total_size:
+                #     if args.fixed_width:
+                #         logger.info("Box size regularization with fixed widths is redundant, so regularization has been disabled")
+                #         reg_lambda = -1
+                #         reg_loss = 0.0
+                #     else:
+                #         reg_loss = total_box_size_reg(rel_deltas=model.rel_deltas, reg_lambda=args.reg_lambda,
+                #                                         log_box_size=args.total_log_box_size)
+                # else:
+                reg_loss = 0.0
+                if args.obj_fct == 'neg_samp':
+                    loss = - loss_n_term - loss_p_term + reg_loss
+                elif args.obj_fct == 'margin_based':
+                    loss = torch.reduce_sum(torch.max(0.0, args.loss_margin + loss_pos - loss_neg))
+                else:
+                    raise ValueError("Error obj fct name.")
+
+                # if args.reg_points > 0:
+                #     loss += args.reg_points * (torch.nn.MSELoss(batch_point_representations) +
+                #                                     torch.nn.MSELoss(batch_rel_bases))
+
+                all_loss += loss.item()
+
+                loss.backward()
+                optimizer.step()
+
+                if (step+1) % args.log_interval == 0:
+                    avg_loss = all_loss / args.log_interval
+                    logger.info("[Epoch {}] @ Step {} Avg batch loss: {}".format(epoch+1, step+1, avg_loss))
+                    all_loss = 0
+                
+            if (epoch+1) % args.valid_interval == 0:
+
+                logger.info("Valid @ Epoch {}".format(epoch+1))
+
+                res = test_or_valid(model, valid_triples, nentity, nrelation, use_cuda, args)
+
+                logger.info("[valid]: MR:{}, MRR:{}, Hits@1: {}, Hits@3: {}, Hits@10:{}".format(
+                    res['MR'], res['MRR'], res['HITS@1'], res['HITS@3'], res['HITS@10']
+                ))
+
+            if (epoch+1) % args.save_interval == 0 and epoch:
+
+                if not os.path.exists(CHECKPOINTS_DIR):
+                    os.makedirs(CHECKPOINTS_DIR)
+
+                torch.save(model, CHECKPOINTS_DIR / 'epoch_{}.pt'.format(epoch+1))
+        
+        if args.do_test:
+
+            res = test_or_valid(model, valid_triples, nentity, nrelation, use_cuda, args)
+
+            logger.info("[test]: MR:{}, MRR:{}, Hits@1: {}, Hits@3: {}, Hits@10:{}".format(
+                res['MR'], res['MRR'], res['HITS@1'], res['HITS@3'], res['HITS@10']
+            ))
 
     elif args.model_name == 'RotatE':
-
-        use_cuda = False
         
         entity2id, relation2id = get_dicts(args.target_KB)
 
@@ -261,10 +499,10 @@ def main():
         model = MyRotatE(args)
 
         if not args.no_cuda and torch.cuda.is_available():
-
             use_cuda = True
-
             model = model.cuda()
+        else:
+            use_cuda = False
 
         train_triples, test_triples, valid_triples = read_triples(args.target_KB, entity2id, relation2id)
 
@@ -273,19 +511,19 @@ def main():
         logger.info("# Train {} | # Test {} | # Valid {}".format(len(train_triples), len(test_triples), len(valid_triples)))
 
         train_dataloader_head = DataLoader(
-            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'head-batch'), 
+            CrossSampling_TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'head-batch'), 
             batch_size=args.batch_size,
             shuffle=True, 
             num_workers=0, # change here to cpu_num//2 if possible
-            collate_fn=TrainDataset.collate_fn
+            collate_fn=CrossSampling_TrainDataset.collate_fn
         )
         
         train_dataloader_tail = DataLoader(
-            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'tail-batch'), 
+            CrossSampling_TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'tail-batch'), 
             batch_size=args.batch_size,
             shuffle=True, 
             num_workers=0, # change here to cpu_num//2 if possible
-            collate_fn=TrainDataset.collate_fn
+            collate_fn=CrossSampling_TrainDataset.collate_fn
         )
 
         train_iterator = BidirectionalOneShotIterator(train_dataloader_head, train_dataloader_tail)
@@ -312,14 +550,13 @@ def main():
         if args.negative_adversarial_sampling:
             logging.info('adversarial_temperature = %f' % args.adversarial_temperature)
 
-
-        model.train()
-
         all_positive_loss = 0
         all_negative_loss = 0
         all_loss = 0
         
         for epoch in trange(int(args.epochs), desc="Epoch"):
+
+            model.train()
 
             for step, turple in enumerate(train_iterator):
 
@@ -332,7 +569,6 @@ def main():
                     positive_batch = positive_batch.cuda()
                     negative_batch = negative_batch.cuda()
                     subsampling_weight = subsampling_weight.cuda()
-
 
                 negative_score = model((positive_batch, negative_batch), mode=mode)
 
@@ -375,9 +611,9 @@ def main():
                 
             if (epoch+1) % args.valid_interval == 0:
 
-                logger.info("Valid @ Epoch {}".format(epoch+1, step+1))
+                logger.info("Valid @ Epoch {}".format(epoch+1))
 
-                res = test_or_valid(model, valid_triples, all_true_triples, nentity, nrelation, use_cuda, args)
+                res = crosssampling_test_or_valid(model, valid_triples, all_true_triples, nentity, nrelation, use_cuda, args)
 
                 logger.info("[valid]: MR:{}, MRR:{}, Hits@1: {}, Hits@3: {}, Hits@10:{}".format(
                     res['MR'], res['MRR'], res['HITS@1'], res['HITS@3'], res['HITS@10']
@@ -394,7 +630,7 @@ def main():
 
         if args.do_test:
 
-            res = test_or_valid(model, test_triples, all_true_triples, nentity, nrelation, use_cuda, args)
+            res = crosssampling_test_or_valid(model, test_triples, all_true_triples, nentity, nrelation, use_cuda, args)
 
             logger.info("[test]: MR:{}, MRR:{}, Hits@1: {}, Hits@3: {}, Hits@10:{}".format(
                 res['MR'], res['MRR'], res['HITS@1'], res['HITS@3'], res['HITS@10']
