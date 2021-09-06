@@ -2,19 +2,21 @@ import argparse
 import logging
 import os
 import torch
+
 from tqdm import tqdm, trange
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
-from model import MyBoxE, MyRotatE, total_box_size_reg
-from utils.kb import get_dicts, read_triples, load_kb_file
-from utils.paths import CHECKPOINTS_DIR, get_dataset_dir
+from model import MyBoxE, MyRotatE, MyTransE
+from utils.kb import get_dicts, read_triples
+from utils.paths import CHECKPOINTS_DIR, LOG_DIR, TENSORBOARD_DIR
 from utils.meta import kb_metadata
 from dataloader import TrainDataset, TestDataset, CrossSampling_TrainDataset, CrossSampling_TestDataset, BidirectionalOneShotIterator
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    filename='./logs/training.log',
+    filename=LOG_DIR / 'training.log',
     filemode='w',
     datefmt="%Y-%m-%d %H:%M:%S",
     level=os.environ.get("LOGLEVEL", "INFO").upper(),
@@ -230,8 +232,10 @@ def test_or_valid(model, triples, nentity, nrelation, use_cuda, args):
 
                     score = model(corrupt_sample)
 
-                    indices = torch.argsort(score, dim=0, descending=True)
-                    rank = indices[sample[:,pos]].item() + 1
+                    indices = torch.argsort(score, dim=0, descending=False)
+                    rank = (indices == sample[:,pos].repeat(indices.shape[0])).nonzero()
+                    rank = rank.item() + 1
+
                     logs.append({
                         'MRR': 1.0/rank,
                         'MR': float(rank),
@@ -339,16 +343,128 @@ def main():
     args = parse_args(parser)
     logger.info(args)
 
-    if args.model_name == 'BoxE':
+    if args.use_tensorboard:
+
+        writer = SummaryWriter(TENSORBOARD_DIR)
+
+    if args.model_name == 'TransE':
 
         try:
             nentity = kb_metadata[args.target_KB][0]
             nrelation = kb_metadata[args.target_KB][1]
+            max_arity = kb_metadata[args.target_KB][2]
         except KeyError:
             raise KeyError("No KB named "+args.target_KB)
 
-        # pos_data = load_kb_file(get_dataset_dir(args.target_KB) / 'train.kb')
-        # pos_data = torch.tensor(pos_data)
+        if max_arity > 2:
+            raise KeyError("TransE doesn't support kb contains arity > 2.")
+
+        entity2id, relation2id = get_dicts(args.target_KB)
+
+        train_triples, test_triples, valid_triples = read_triples(args.target_KB, entity2id, relation2id)
+
+        train_dataloader = DataLoader(
+            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size), 
+            batch_size=args.batch_size,
+            shuffle=True, 
+            num_workers=0, # change here to cpu_num//2 if possible
+            collate_fn=TrainDataset.collate_fn
+        )
+
+        model = MyTransE(args)
+
+        if args.use_tensorboard:
+            graph_input = torch.randint(0, model.relations_num, (1, model.max_arity))
+            writer.add_graph(model, graph_input)
+            writer.close()
+
+        if not args.no_cuda and torch.cuda.is_available():
+            use_cuda = True
+            model = model.cuda()
+        else:
+            use_cuda = False
+    
+        current_learning_rate = args.lr
+
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()), 
+            lr=current_learning_rate
+        )
+
+        loss_margin = torch.tensor(args.loss_margin)
+
+        all_loss = 0.0
+
+        for epoch in trange(int(args.epochs), desc="Epoch"):
+
+            model.train()
+
+            for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
+
+                positive_samples, negative_samples = batch
+                
+                optimizer.zero_grad()
+
+                negative_samples = negative_samples.flatten(start_dim=0, end_dim=1)
+
+                if use_cuda:
+
+                    positive_samples = positive_samples.cuda()
+                    negative_samples = negative_samples.cuda()
+
+                positive_score = model(positive_samples)
+                negative_score = model(negative_samples)
+
+                negative_score = negative_score.reshape(positive_samples.shape[0], args.negative_sample_size)
+
+                negative_score = torch.mean(negative_score, dim=1)
+
+                loss = torch.sum(torch.max(positive_score - negative_score, -loss_margin) + loss_margin)
+
+                all_loss += loss.item()
+
+                loss.backward()
+                optimizer.step()
+
+                if (step+1) % args.log_interval == 0:
+                    avg_loss = all_loss / args.log_interval
+                    logger.info("[Epoch {}] @ Step {} Avg batch loss: {}".format(epoch+1, step+1, avg_loss))
+                    all_loss = 0
+                
+            if (epoch+1) % args.valid_interval == 0:
+
+                logger.info("Valid @ Epoch {}".format(epoch+1))
+
+                res = test_or_valid(model, valid_triples, nentity, nrelation, use_cuda, args)
+
+                logger.info("[valid]: MR:{}, MRR:{}, Hits@1: {}, Hits@3: {}, Hits@10:{}".format(
+                    res['MR'], res['MRR'], res['HITS@1'], res['HITS@3'], res['HITS@10']
+                ))
+
+            if (epoch+1) % args.save_interval == 0 and epoch:
+
+                if not os.path.exists(CHECKPOINTS_DIR):
+                    os.makedirs(CHECKPOINTS_DIR)
+
+                torch.save(model, CHECKPOINTS_DIR / 'epoch_{}.pt'.format(epoch+1))
+        
+        if args.do_test:
+
+            res = test_or_valid(model, valid_triples, nentity, nrelation, use_cuda, args)
+
+            logger.info("[test]: MR:{}, MRR:{}, Hits@1: {}, Hits@3: {}, Hits@10:{}".format(
+                res['MR'], res['MRR'], res['HITS@1'], res['HITS@3'], res['HITS@10']
+            ))
+        
+
+    elif args.model_name == 'BoxE':
+
+        try:
+            nentity = kb_metadata[args.target_KB][0]
+            nrelation = kb_metadata[args.target_KB][1]
+            max_arity = kb_metadata[args.target_KB][2]
+        except KeyError:
+            raise KeyError("No KB named "+args.target_KB)
 
         entity2id, relation2id = get_dicts(args.target_KB)
 
@@ -364,6 +480,11 @@ def main():
 
         model = MyBoxE(args)
 
+        if args.use_tensorboard:
+            graph_input = torch.randint(0, model.relations_num, (1, model.max_arity))
+            writer.add_graph(model, graph_input)
+            writer.close()
+
         if not args.no_cuda and torch.cuda.is_available():
             use_cuda = True
             model = model.cuda()
@@ -377,7 +498,7 @@ def main():
             lr=current_learning_rate
         )
 
-        all_loss = 0
+        all_loss = 0.0
 
         for epoch in trange(int(args.epochs), desc="Epoch"):
 
@@ -635,6 +756,8 @@ def main():
             logger.info("[test]: MR:{}, MRR:{}, Hits@1: {}, Hits@3: {}, Hits@10:{}".format(
                 res['MR'], res['MRR'], res['HITS@1'], res['HITS@3'], res['HITS@10']
             ))
+    else:
+        raise KeyError("Model has not been implemented. Check model name again.")
                 
 if __name__ == "__main__":
     main()

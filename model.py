@@ -25,6 +25,65 @@ logging.basicConfig(
 
 logger = logging.getLogger("model")
 
+class MyTransE(nn.Module):
+
+    def __init__(self, args):
+
+        super(MyTransE, self).__init__() 
+        
+        self.args = args
+
+        self.norm = 1
+
+        try:
+            self.entities_num = kb_metadata[self.args.target_KB][0]
+            self.relations_num = kb_metadata[self.args.target_KB][1]
+            self.max_arity = kb_metadata[self.args.target_KB][2]
+        except KeyError:
+            raise KeyError("No KB named "+self.args.target_KB)
+
+        self.ent_embeddings = nn.Embedding(self.entities_num, self.args.embedding_dim)
+        self.rel_embeddings = nn.Embedding(self.relations_num, self.args.embedding_dim)
+
+        self.gamma = nn.Parameter(
+            torch.Tensor([self.args.gamma]), 
+            requires_grad=False
+        )
+
+        self.epsilon = 2.0
+
+        self.embedding_range = nn.Parameter(
+            torch.Tensor([(self.gamma.item() + self.epsilon) / self.args.embedding_dim]), 
+            requires_grad=False
+        )
+
+        nn.init.uniform_(
+            tensor = self.ent_embeddings.weight.data, 
+            a = -self.embedding_range.item(), 
+            b = self.embedding_range.item()
+        )
+        nn.init.uniform_(
+            tensor = self.rel_embeddings.weight.data, 
+            a = -self.embedding_range.item(),
+            b = self.embedding_range.item()
+        )
+
+    def forward(self, sample):
+
+        batch_h = sample[:,0]
+        batch_t = sample[:,1]
+        batch_r = sample[:,2]
+
+        h = self.ent_embeddings(batch_h)
+        t = self.ent_embeddings(batch_t)
+        r = self.rel_embeddings(batch_r)
+
+        score = h + r - t
+
+        score = torch.norm(score, self.norm, -1)
+
+        return score
+
 def compute_box(box_base, box_delta):
     box_second = box_base + half * box_delta
     box_first = box_base - half * box_delta
@@ -101,14 +160,13 @@ def total_box_size_reg(rel_deltas, reg_lambda, log_box_size): # Regularization b
 def q2b_loss(points, lower_corner, upper_corner):
     # Query2Box Loss Function: https://arxiv.org/pdf/2002.05969.pdf
     centres = 1 / 2 * (lower_corner + upper_corner)
-    dist_outside = torch.max(points - upper_corner, 0.0) + torch.max(lower_corner - points, 0.0)
+    dist_outside = torch.max(points - upper_corner, zero) + torch.max(lower_corner - points, zero)
     dist_inside = centres - torch.min(upper_corner, torch.min(lower_corner, points))
     
     return dist_outside, dist_inside
 
 def loss_function_q2b(batch_points, rel_box_low, rel_box_high, batch_rel_mults, dim_dropout_prob=zero, order=2, alpha=0.2):
-    batch_box_inside, batch_box_outside = q2b_loss("Q2B_Box_Loss", batch_points, rel_box_low, rel_box_high,
-                                                batch_rel_mults)
+    batch_box_inside, batch_box_outside = q2b_loss(batch_points, rel_box_low, rel_box_high)
     
     bbi = torch.norm(F.dropout(batch_box_inside, p=dim_dropout_prob), dim=2, p=order)
     bbi_masked = torch.sum(bbi, dim=1)
@@ -155,7 +213,7 @@ class MyBoxE(nn.Module):
     def embed(self):
         # entity embeddings
         entity_table_shape = [self.entities_num, self.args.embedding_dim]
-        self.sqrt_dim = torch.sqrt(torch.tensor(self.args.embedding_dim + 0.0))
+        self.sqrt_dim = torch.sqrt(torch.tensor(self.args.embedding_dim + 0.0, requires_grad=False))
         # 限定了embeddings的上下界[-1/2*sqrt(embedding_dim), 1/2*sqrt(embedding_dim)]
         self.entity_points = init_var(entity_table_shape, -0.5 / self.sqrt_dim, 0.5 / self.sqrt_dim)
         self.entities_with_pad = torch.nn.Parameter(add_padding(self.entity_points))

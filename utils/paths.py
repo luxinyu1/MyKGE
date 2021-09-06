@@ -8,6 +8,9 @@ DATASETPLAIN_DIR = REPO_DIR / 'datasets_plain'
 
 CHECKPOINTS_DIR = REPO_DIR / 'checkpoints'
 
+LOG_DIR = REPO_DIR / 'logs'
+TENSORBOARD_DIR = LOG_DIR / 'tensorboard'
+
 def get_dataset_dir(dataset):
     return DATASETS_DIR / dataset
 

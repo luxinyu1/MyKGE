@@ -1,0 +1,1 @@
+python ./train.py --model-name "TransE" --target-KB "FB15k-237" --epochs 1000 --embedding-dim 500 --negative-sample-size 25 --batch-size 1024 --save-interval 50 --log-interval 50 --valid-interval 50 --loss-margin 6.0
