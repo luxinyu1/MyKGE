@@ -4,8 +4,8 @@ I'm still working on adding more embedding models and improving the performance 
 
 ## Requirements
 
-- torch**==**1.9.0+cu111
-- tensorboard**==**2.6.0
+- torch==1.9.0+cu111
+- tensorboard==2.6.0
 
 ## Usage
 Run scripts under ```./scripts/``` directory. For example, you can use the following command to train a RotatE model and evaluate its performance:
